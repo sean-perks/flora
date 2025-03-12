@@ -7,6 +7,9 @@ It works as is and is fairly accurate at spell check. it is VERY slow, so that n
 
 @author: sperks
 """
+from dask import delayed, compute
+import dask.dataframe as dd
+import pandas as pd
 
 from ui.input_validation import *
 from joblib import Memory
@@ -19,77 +22,85 @@ import timeit
 
 
 class SpellCheck:
-    memory = Memory(expanduser('~/.cache/spell'), verbose=0)
     mega_df = pd.read_pickle(r"C:\Users\sperks\PycharmProjects\flora basic\data\mega_species_list_pickle.pkl")
-    mega_df.fillna(value = "NONE", inplace = True)
-    ALL_SPECIES = list(mega_df["scientific_name"])
+    mega_df = dd.from_pandas(mega_df, npartitions=4)
+    mega_df = mega_df.fillna("NONE")
+    ALL_SPECIES = set(mega_df["scientific_name"].compute())
     SYNONYM_DF = mega_df[mega_df["Synonym Symbol"] != "NONE"]
-    SYNONYMS = list(SYNONYM_DF["scientific_name"])
+    SYNONYMS = set(SYNONYM_DF["scientific_name"].compute())
+
 
     @classmethod
-    @memory.cache
-    def load_words(cls):
-        return tuple([x.strip() for x in cls.ALL_SPECIES])
+    def spell(cls, word, count=3):
+        def compute_distances(df):
+            df["lev_distance"] = df["scientific_name"].apply(
+                lambda x: levenshtein(word, x)
+            )
+            df_sorted = df.sort_values("lev_distance", ascending=True).head(count)
 
-    @classmethod
-    @memory.cache
-    def spell(cls, word, count=3, dict_words=None):
-        dict_words = cls.load_words() if dict_words is None else dict_words
-        word_list = sorted(dict_words, key=lambda dw: levenshtein(word, dw))[:count]
-        word_dict = {}
-        c=1
-        for item in word_list:
-            word_dict[str(c)] = item
-            c += 1
+            # get best matches
+            return df_sorted[["scientific_name", "lev_distance"]]
+
+        meta = pd.DataFrame(columns=["scientific_name", "lev_distance"], dtype='object')
+        closest_matches = cls.mega_df.map_partitions(compute_distances, meta=meta)
+        closest_combined = closest_matches.compute().sort_values("lev_distance", ascending=True).head(count).reset_index()
+
+
+        word_dict = {str(i+1): row["scientific_name"] for i, row in closest_combined.iterrows()}
         return word_dict
 
     @classmethod
     def lookup_symbol(cls, symbol):
-        for index, row in cls.mega_df.iterrows():
-            if row["Symbol"] == symbol:
-                return row["scientific_name"]
-            return None
+        # Looking up a scientific name based on its symbol
+        # This is still using Dask but performs better with pandas for small lookups
+        symbol_df = cls.mega_df[cls.mega_df["Symbol"] == symbol]
+        symbol_row = symbol_df.compute()
+        if not symbol_row.empty:
+            return symbol_row["scientific_name"].iloc[0]
+        return None
 
     @classmethod
     def check_synonym(cls, word):
+        # Check if the word is a synonym, return the correct name if it's a synonym
         if word not in cls.SYNONYMS:
             return word
-        for index, row in cls.SYNONYM_DF.iterrows():
-            if row["scientific_name"] == word:
-                new_name = cls.lookup_symbol(row["Symbol"])
-                if new_name is not None:
-                    return new_name
-                else:
-                    return word
-
+        synonym_row = cls.SYNONYM_DF[cls.SYNONYM_DF["scientific_name"] == word]
+        synonym_row = synonym_row.compute()
+        if not synonym_row.empty:
+            new_name = cls.lookup_symbol(synonym_row["Symbol"].iloc[0])
+            if new_name is not None:
+                return new_name
+        return word
 
     @staticmethod
     def print_dict(dict):
-        print()
+        # Utility function to print the dictionary
         for k, v in dict.items():
             print(f"{k}. {v}")
 
-
     @classmethod
-    def spell_check_list(cls, species_list):
+    def spell_check_list(cls, species_list, count=3):
+        # Main spell-checking function
         new_list = []
         if species_list is None:
-            return
+            return new_list
+
         for word in species_list:
-            # word found in the mega usda list
-            if word in cls.ALL_SPECIES:
+            # Word found in the mega USDA list
+            if word in cls.ALL_SPECIES:  # We compute the Dask DataFrame for this check
                 checked_word = cls.check_synonym(word)
                 if checked_word != word:
-                    accept_synonym = y_n(f"\n{word} is a synonym! Would you like to use the new name: {checked_word}? (y/n): ")
+                    accept_synonym = y_n(
+                        f"\n{word} is a synonym! Would you like to use the new name: {checked_word}? (y/n): ")
                     if accept_synonym:
                         new_list.append(checked_word)
                     else:
                         new_list.append(word)
                 else:
                     new_list.append(checked_word)
-            # word not in mega usda list (spelt wrong)
+            # Word not in mega USDA list (spelt wrong)
             else:
-                word_dict = cls.spell(word)
+                word_dict = cls.spell(word, count)  # Call the spell method for Levenshtein distance
                 word_dict[str(len(word_dict) + 1)] = "None of these"
                 choices = list(word_dict.keys())
                 print(f"\n\nOriginal spelling: {word}")
@@ -109,3 +120,7 @@ class SpellCheck:
         return new_list
 
 
+if __name__ == "__main__":
+    test = ["achila millyfoluim", "taxus brevinfolium", "rubuss parvinflorum"]
+    test_result = SpellCheck.spell_check_list(test, 5)
+    print(test_result)
